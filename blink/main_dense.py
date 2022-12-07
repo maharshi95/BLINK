@@ -4,6 +4,7 @@
 # This source code is licensed under the license found in the
 # LICENSE file in the root directory of this source tree.
 #
+import os
 import argparse
 import json
 import sys
@@ -79,6 +80,7 @@ def _annotate(ner_model, input_sentences):
     samples = []
     for mention in mentions:
         record = {}
+        record["tag"] = [t.to_dict() for t in mention["labels"]]
         record["label"] = "unknown"
         record["label_id"] = -1
         # LOWERCASE EVERYTHING !
@@ -239,7 +241,7 @@ def _run_biencoder(biencoder, dataloader, candidate_encoding, top_k=100, indexer
     labels = []
     nns = []
     all_scores = []
-    for batch in tqdm(dataloader):
+    for batch in dataloader:
         context_input, _, label_ids = batch
         with torch.no_grad():
             if indexer is not None:
@@ -269,12 +271,22 @@ def _process_crossencoder_dataloader(context_input, label_input, crossencoder_pa
     return dataloader
 
 
-def _run_crossencoder(crossencoder, dataloader, logger, context_len, device="cuda"):
+def _run_crossencoder(
+    crossencoder, dataloader, logger, context_len, device="cuda", silent=False
+):
     crossencoder.model.eval()
     accuracy = 0.0
     crossencoder.to(device)
 
-    res = evaluate(crossencoder, dataloader, device, logger, context_len, zeshel=False, silent=False)
+    res = evaluate(
+        crossencoder,
+        dataloader,
+        device,
+        logger,
+        context_len,
+        zeshel=False,
+        silent=silent,
+    )
     accuracy = res["normalized_accuracy"]
     logits = res["logits"]
 
@@ -318,10 +330,10 @@ def load_models(args, logger=None):
         wikipedia_id2local_id,
         faiss_indexer,
     ) = _load_candidates(
-        args.entity_catalogue, 
-        args.entity_encoding, 
-        faiss_index=getattr(args, 'faiss_index', None), 
-        index_path=getattr(args, 'index_path' , None),
+        args.entity_catalogue,
+        args.entity_encoding,
+        faiss_index=getattr(args, "faiss_index", None),
+        index_path=getattr(args, "index_path", None),
         logger=logger,
     )
 
@@ -499,7 +511,13 @@ def run(
 
         # prepare crossencoder data
         context_input, candidate_input, label_input = prepare_crossencoder_data(
-            crossencoder.tokenizer, samples, labels, nns, id2title, id2text, keep_all,
+            crossencoder.tokenizer,
+            samples,
+            labels,
+            nns,
+            id2title,
+            id2text,
+            keep_all,
         )
 
         context_input = modify(
@@ -570,7 +588,9 @@ def run(
 
                 if len(samples) > 0:
                     overall_unormalized_accuracy = (
-                        crossencoder_normalized_accuracy * len(label_input) / len(samples)
+                        crossencoder_normalized_accuracy
+                        * len(label_input)
+                        / len(samples)
                     )
                 print(
                     "overall unnormalized accuracy: %.4f" % overall_unormalized_accuracy
@@ -586,8 +606,137 @@ def run(
             )
 
 
+def run_entity_linking(
+    args,
+    logger,
+    biencoder,
+    biencoder_params,
+    crossencoder,
+    crossencoder_params,
+    candidate_encoding,
+    title2id,
+    id2title,
+    id2text,
+    wikipedia_id2local_id,
+    faiss_indexer=None,
+    test_data=None,
+):
+
+    if not test_data:
+        msg = f"No Test data found: {test_data}"
+        raise ValueError(msg)
+
+    id2url = {
+        v: "https://en.wikipedia.org/wiki?curid=%s" % k
+        for k, v in wikipedia_id2local_id.items()
+    }
+
+    samples = test_data
+
+    # ner_model = NER.get_model()
+
+    # # Identify mentions
+    # samples = _annotate(ner_model, test_data)
+
+    # don't look at labels
+    keep_all = samples[0]["label"] == "unknown" or samples[0]["label_id"] < 0
+
+    # prepare the data for biencoder
+    if logger:
+        logger.info("preparing data for biencoder")
+    dataloader = _process_biencoder_dataloader(
+        samples, biencoder.tokenizer, biencoder_params
+    )
+
+    # run biencoder
+    if logger:
+        logger.info("run biencoder")
+    top_k = args.top_k
+    labels, nns, scores = _run_biencoder(
+        biencoder, dataloader, candidate_encoding, top_k, faiss_indexer
+    )
+
+    if args.fast:
+        fast_predictions = []
+        for entity_list, sample in zip(nns, samples):
+            sample_prediction = []
+            for e_id in entity_list:
+                pred = {
+                    "id": e_id,
+                    "title": id2title[e_id],
+                    "text": id2text[e_id],
+                    "url": id2url[e_id],
+                    "sample": sample,
+                }
+                sample_prediction.append(pred)
+            fast_predictions.append(sample_prediction)
+        return fast_predictions, scores
+
+    # prepare crossencoder data
+    context_input, candidate_input, label_input = prepare_crossencoder_data(
+        crossencoder.tokenizer,
+        samples,
+        labels,
+        nns,
+        id2title,
+        id2text,
+        keep_all,
+    )
+
+    context_input = modify(
+        context_input, candidate_input, crossencoder_params["max_seq_length"]
+    )
+
+    dataloader = _process_crossencoder_dataloader(
+        context_input, label_input, crossencoder_params
+    )
+
+    # run crossencoder and get accuracy
+    accuracy, index_array, unsorted_scores = _run_crossencoder(
+        crossencoder,
+        dataloader,
+        logger,
+        context_len=biencoder_params["max_context_length"],
+        silent=True,
+    )
+
+    predictions = []
+    scores = []
+    for entity_list, index_list, scores_list, sample in zip(
+        nns, index_array, unsorted_scores, samples
+    ):
+        index_list = index_list.tolist()
+
+        # descending order
+        index_list.reverse()
+
+        sample_prediction = []
+        sample_scores = []
+        for index in index_list:
+            e_id = entity_list[index]
+            pred = {
+                "id": e_id,
+                "title": id2title[e_id],
+                "text": id2text[e_id],
+                "url": id2url[e_id],
+                "sample": sample,
+            }
+            sample_prediction.append(pred)
+            sample_scores.append(scores_list[index])
+        predictions.append(sample_prediction)
+        scores.append(sample_scores)
+
+    return predictions, scores
+
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
+
+    DEFAULT_MODEL_BASE_DIR = (
+        os.environ["BLINK_MODELS_DIR"]
+        if "BLINK_MODELS_DIR" in os.environ
+        else ".models/"
+    )
 
     parser.add_argument(
         "--interactive", "-i", action="store_true", help="Interactive mode."
@@ -606,30 +755,30 @@ if __name__ == "__main__":
         "--biencoder_model",
         dest="biencoder_model",
         type=str,
-        default="models/biencoder_wiki_large.bin",
+        default=f"{DEFAULT_MODEL_BASE_DIR}/biencoder_wiki_large.bin",
         help="Path to the biencoder model.",
     )
     parser.add_argument(
         "--biencoder_config",
         dest="biencoder_config",
         type=str,
-        default="models/biencoder_wiki_large.json",
+        default=f"{DEFAULT_MODEL_BASE_DIR}/biencoder_wiki_large.json",
         help="Path to the biencoder configuration.",
     )
     parser.add_argument(
         "--entity_catalogue",
         dest="entity_catalogue",
         type=str,
-        # default="models/tac_entity.jsonl",  # TAC-KBP
-        default="models/entity.jsonl",  # ALL WIKIPEDIA!
+        # default=f"{DEFAULT_MODEL_BASE_DIR}/tac_entity.jsonl",  # TAC-KBP
+        default=f"{DEFAULT_MODEL_BASE_DIR}/entity.jsonl",  # ALL WIKIPEDIA!
         help="Path to the entity catalogue.",
     )
     parser.add_argument(
         "--entity_encoding",
         dest="entity_encoding",
         type=str,
-        # default="models/tac_candidate_encode_large.t7",  # TAC-KBP
-        default="models/all_entities_large.t7",  # ALL WIKIPEDIA!
+        # default=f"{DEFAULT_MODEL_BASE_DIR}/tac_candidate_encode_large.t7",  # TAC-KBP
+        default=f"{DEFAULT_MODEL_BASE_DIR}/all_entities_large.t7",  # ALL WIKIPEDIA!
         help="Path to the entity catalogue.",
     )
 
@@ -638,14 +787,14 @@ if __name__ == "__main__":
         "--crossencoder_model",
         dest="crossencoder_model",
         type=str,
-        default="models/crossencoder_wiki_large.bin",
+        default=f"{DEFAULT_MODEL_BASE_DIR}/crossencoder_wiki_large.bin",
         help="Path to the crossencoder model.",
     )
     parser.add_argument(
         "--crossencoder_config",
         dest="crossencoder_config",
         type=str,
-        default="models/crossencoder_wiki_large.json",
+        default=f"{DEFAULT_MODEL_BASE_DIR}/crossencoder_wiki_large.json",
         help="Path to the crossencoder configuration.",
     )
 
@@ -678,11 +827,17 @@ if __name__ == "__main__":
     )
 
     parser.add_argument(
-        "--faiss_index", type=str, default=None, help="whether to use faiss index",
+        "--faiss_index",
+        type=str,
+        default=None,
+        help="whether to use faiss index",
     )
 
     parser.add_argument(
-        "--index_path", type=str, default=None, help="path to load indexer",
+        "--index_path",
+        type=str,
+        default=None,
+        help="path to load indexer",
     )
 
     args = parser.parse_args()
