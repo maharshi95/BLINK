@@ -621,7 +621,6 @@ def run_entity_linking(
     faiss_indexer=None,
     test_data=None,
 ):
-
     if not test_data:
         msg = f"No Test data found: {test_data}"
         raise ValueError(msg)
@@ -658,7 +657,7 @@ def run_entity_linking(
 
     if args.fast:
         fast_predictions = []
-        for entity_list, sample in zip(nns, samples):
+        for entity_list, sample, score in zip(nns, samples, scores):
             sample_prediction = []
             for e_id in entity_list:
                 pred = {
@@ -667,10 +666,11 @@ def run_entity_linking(
                     "text": id2text[e_id],
                     "url": id2url[e_id],
                     "sample": sample,
+                    "score": score,
                 }
                 sample_prediction.append(pred)
             fast_predictions.append(sample_prediction)
-        return fast_predictions, scores
+        return fast_predictions
 
     # prepare crossencoder data
     context_input, candidate_input, label_input = prepare_crossencoder_data(
@@ -701,7 +701,6 @@ def run_entity_linking(
     )
 
     predictions = []
-    scores = []
     for entity_list, index_list, scores_list, sample in zip(
         nns, index_array, unsorted_scores, samples
     ):
@@ -720,13 +719,13 @@ def run_entity_linking(
                 "text": id2text[e_id],
                 "url": id2url[e_id],
                 "sample": sample,
+                "score": scores_list[index],
             }
             sample_prediction.append(pred)
             sample_scores.append(scores_list[index])
         predictions.append(sample_prediction)
-        scores.append(sample_scores)
 
-    return predictions, scores
+    return predictions
 
 
 if __name__ == "__main__":
