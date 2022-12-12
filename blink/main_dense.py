@@ -29,6 +29,8 @@ from blink.crossencoder.train_cross import modify, evaluate
 from blink.crossencoder.data_process import prepare_crossencoder_data
 from blink.indexer.faiss_indexer import DenseFlatIndexer, DenseHNSWFlatIndexer
 
+from tqdm.auto import tqdm
+
 
 HIGHLIGHTS = [
     "on_red",
@@ -103,7 +105,8 @@ def _load_candidates(
 ):
     # only load candidate encoding if not using faiss index
     if faiss_index is None:
-        candidate_encoding = torch.load(entity_encoding)
+        index_device = "cuda" if torch.cuda.is_available() else "cpu"
+        candidate_encoding = torch.load(entity_encoding).to(index_device)
         indexer = None
     else:
         if logger:
@@ -126,7 +129,9 @@ def _load_candidates(
     local_idx = 0
     with open(entity_catalogue, "r") as fin:
         lines = fin.readlines()
-        for line in lines:
+        for line in tqdm(
+            lines, "Reading entity catalogue", unit="lines", total=len(lines)
+        ):
             entity = json.loads(line)
 
             if "idx" in entity:
@@ -236,25 +241,42 @@ def _process_biencoder_dataloader(samples, tokenizer, biencoder_params):
     return dataloader
 
 
-def _run_biencoder(biencoder, dataloader, candidate_encoding, top_k=100, indexer=None):
+def _run_biencoder(
+    biencoder, dataloader, candidate_encoding, top_k=100, indexer=None, logger=None
+):
     biencoder.model.eval()
     labels = []
     nns = []
     all_scores = []
     for batch in dataloader:
         context_input, _, label_ids = batch
+        context_input = context_input.to(biencoder.device)
+        if logger:
+            logger.debug("context_input.shape: {}".format(context_input.shape))
         with torch.no_grad():
             if indexer is not None:
-                context_encoding = biencoder.encode_context(context_input).numpy()
+                context_encoding = biencoder.encode_context(context_input).cpu().numpy()
+                if logger:
+                    logger.debug(
+                        "context_encoding.shape: {}".format(context_encoding.shape)
+                    )
                 context_encoding = np.ascontiguousarray(context_encoding)
+                if logger:
+                    logger.debug(
+                        "After np.contiguous --- context_encoding.shape: {}".format(
+                            context_encoding.shape
+                        )
+                    )
                 scores, indicies = indexer.search_knn(context_encoding, top_k)
             else:
                 scores = biencoder.score_candidate(
-                    context_input, None, cand_encs=candidate_encoding  # .to(device)
+                    context_input,
+                    None,
+                    cand_encs=candidate_encoding.to(biencoder.device),
                 )
                 scores, indicies = scores.topk(top_k)
-                scores = scores.data.numpy()
-                indicies = indicies.data.numpy()
+                scores = scores.data.cpu().numpy()
+                indicies = indicies.data.cpu().numpy()
 
         labels.extend(label_ids.data.numpy())
         nns.extend(indicies)
@@ -307,7 +329,8 @@ def load_models(args, logger=None):
         biencoder_params = json.load(json_file)
         biencoder_params["path_to_model"] = args.biencoder_model
     biencoder = load_biencoder(biencoder_params)
-
+    if logger:
+        logger.info("biencoder loaded on device: {}".format(biencoder.device))
     crossencoder = None
     crossencoder_params = None
     if not args.fast:
@@ -318,6 +341,8 @@ def load_models(args, logger=None):
             crossencoder_params = json.load(json_file)
             crossencoder_params["path_to_model"] = args.crossencoder_model
         crossencoder = load_crossencoder(crossencoder_params)
+        if logger:
+            logger.info("crossencoder loaded on device: {}".format(biencoder.device))
 
     # load candidate entities
     if logger:
@@ -438,7 +463,12 @@ def run(
             logger.info("run biencoder")
         top_k = args.top_k
         labels, nns, scores = _run_biencoder(
-            biencoder, dataloader, candidate_encoding, top_k, faiss_indexer
+            biencoder,
+            dataloader,
+            candidate_encoding,
+            top_k,
+            faiss_indexer,
+            logger=logger,
         )
 
         if args.interactive:
@@ -652,7 +682,7 @@ def run_entity_linking(
         logger.info("run biencoder")
     top_k = args.top_k
     labels, nns, scores = _run_biencoder(
-        biencoder, dataloader, candidate_encoding, top_k, faiss_indexer
+        biencoder, dataloader, candidate_encoding, top_k, faiss_indexer, logger=logger
     )
 
     if args.fast:
@@ -661,12 +691,12 @@ def run_entity_linking(
             sample_prediction = []
             for e_id in entity_list:
                 pred = {
-                    "id": e_id,
+                    "id": int(e_id),
                     "title": id2title[e_id],
                     "text": id2text[e_id],
                     "url": id2url[e_id],
                     "sample": sample,
-                    "score": score,
+                    "score": float(score),
                 }
                 sample_prediction.append(pred)
             fast_predictions.append(sample_prediction)
@@ -714,12 +744,12 @@ def run_entity_linking(
         for index in index_list:
             e_id = entity_list[index]
             pred = {
-                "id": e_id,
+                "id": int(e_id),
                 "title": id2title[e_id],
                 "text": id2text[e_id],
                 "url": id2url[e_id],
                 "sample": sample,
-                "score": scores_list[index],
+                "score": float(scores_list[index]),
             }
             sample_prediction.append(pred)
             sample_scores.append(scores_list[index])
