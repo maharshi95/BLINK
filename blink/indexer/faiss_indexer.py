@@ -16,7 +16,8 @@ import pickle
 import faiss
 import numpy as np
 
-logger = logging.getLogger()
+# logger = logging.getLogger()
+from loguru import logger
 
 
 class DenseIndexer(object):
@@ -32,14 +33,14 @@ class DenseIndexer(object):
         raise NotImplementedError
 
     def serialize(self, index_file: str):
-        logger.info("Serializing index to %s", index_file)
+        logger.info("Serializing index to {}", index_file)
         faiss.write_index(self.index, index_file)
 
     def deserialize_from(self, index_file: str):
-        logger.info("Loading index from %s", index_file)
+        logger.info("Loading index from {}", index_file)
         self.index = faiss.read_index(index_file)
         logger.info(
-            "Loaded index of type %s and size %d", type(self.index), self.index.ntotal
+            "Loaded index of type {} and size {}", type(self.index), self.index.ntotal
         )
 
 
@@ -60,7 +61,7 @@ class DenseFlatIndexer(DenseIndexer):
             self.index.add(vectors)
             cnt += self.buffer_size
 
-        logger.info("Total data indexed %d", n)
+        logger.info("Total data indexed {}", n)
 
     def search_knn(self, query_vectors, top_k):
         scores, indexes = self.index.search(query_vectors, top_k)
@@ -70,7 +71,7 @@ class DenseFlatIndexer(DenseIndexer):
 # DenseHNSWFlatIndexer does approximate search
 class DenseHNSWFlatIndexer(DenseIndexer):
     """
-     Efficient index for retrieval. Note: default settings are for hugh accuracy but also high RAM usage
+    Efficient index for retrieval. Note: default settings are for hugh accuracy but also high RAM usage
     """
 
     def __init__(
@@ -103,7 +104,7 @@ class DenseHNSWFlatIndexer(DenseIndexer):
         phi = 0
         for i, item in enumerate(data):
             doc_vector = item
-            norms = (doc_vector ** 2).sum()
+            norms = (doc_vector**2).sum()
             phi = max(phi, norms)
         logger.info("HNSWF DotProduct -> L2 space phi={}".format(phi))
         self.phi = 0
@@ -114,7 +115,7 @@ class DenseHNSWFlatIndexer(DenseIndexer):
         for i in range(0, n, self.buffer_size):
             vectors = [np.reshape(t, (1, -1)) for t in data[i : i + self.buffer_size]]
 
-            norms = [(doc_vector ** 2).sum() for doc_vector in vectors]
+            norms = [(doc_vector**2).sum() for doc_vector in vectors]
             aux_dims = [np.sqrt(phi - norm) for norm in norms]
             hnsw_vectors = [
                 np.hstack((doc_vector, aux_dims[i].reshape(-1, 1)))
@@ -124,14 +125,14 @@ class DenseHNSWFlatIndexer(DenseIndexer):
 
             self.index.add(hnsw_vectors)
             cnt += self.buffer_size
-            logger.info("Indexed data %d" % cnt)
+            logger.info("Indexed data {}" % cnt)
 
-        logger.info("Total data indexed %d" % n)
+        logger.info("Total data indexed {}" % n)
 
     def search_knn(self, query_vectors, top_k):
         aux_dim = np.zeros(len(query_vectors), dtype="float32")
         query_nhsw_vectors = np.hstack((query_vectors, aux_dim.reshape(-1, 1)))
-        logger.info("query_hnsw_vectors %s", query_nhsw_vectors.shape)
+        logger.info("query_hnsw_vectors {}", query_nhsw_vectors.shape)
         scores, indexes = self.index.search(query_nhsw_vectors, top_k)
         return scores, indexes
 
